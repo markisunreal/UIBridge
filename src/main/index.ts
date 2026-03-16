@@ -5,6 +5,113 @@ import { spawn, ChildProcess } from 'child_process'
 import * as fs from 'fs'
 import Store from 'electron-store'
 import * as chokidar from 'chokidar'
+import * as http from 'http'
+
+// ── UIBridge MCP REST API Server ──────────────────────────────────────────────
+const MCP_API_PORT = 3765
+let mcpApiServer: http.Server | null = null
+let lastAnnotations: string = ''   // updated by renderer via IPC
+let lastCaptureDataUrl: string = '' // updated on each capture
+
+function startMcpApiServer(): void {
+  mcpApiServer = http.createServer(async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Content-Type', 'application/json')
+
+    const url = new URL(req.url!, `http://localhost:${MCP_API_PORT}`)
+
+    // GET /status
+    if (req.method === 'GET' && url.pathname === '/status') {
+      res.end(JSON.stringify({
+        running: true,
+        project: currentProjectPath,
+        devServerUrl: devServerPort ? `http://localhost:${devServerPort}` : null,
+        timestamp: Date.now()
+      }))
+      return
+    }
+
+    // GET /project
+    if (req.method === 'GET' && url.pathname === '/project') {
+      res.end(JSON.stringify({
+        path: currentProjectPath,
+        name: currentProjectPath ? currentProjectPath.split('/').pop() : null,
+        devServerUrl: devServerPort ? `http://localhost:${devServerPort}` : null
+      }))
+      return
+    }
+
+    // POST /capture  → captures webview screenshot, returns base64 PNG
+    if (req.method === 'POST' && url.pathname === '/capture') {
+      try {
+        if (!mainWindow) throw new Error('UIBridge window not ready')
+        const image = await mainWindow.webContents.capturePage()
+        lastCaptureDataUrl = image.toDataURL()
+
+        // Also ask renderer to do a webview-only capture
+        mainWindow.webContents.send('mcp-capture-request')
+
+        res.end(JSON.stringify({
+          success: true,
+          dataUrl: lastCaptureDataUrl,
+          width: image.getSize().width,
+          height: image.getSize().height,
+          timestamp: Date.now()
+        }))
+      } catch (e: any) {
+        res.statusCode = 500
+        res.end(JSON.stringify({ success: false, error: e.message }))
+      }
+      return
+    }
+
+    // GET /annotations  → returns tldraw canvas annotations
+    if (req.method === 'GET' && url.pathname === '/annotations') {
+      res.end(JSON.stringify({
+        content: lastAnnotations,
+        timestamp: Date.now()
+      }))
+      return
+    }
+
+    // GET /context  → full snapshot: project + screenshot + annotations
+    if (req.method === 'GET' && url.pathname === '/context') {
+      try {
+        let captureDataUrl = lastCaptureDataUrl
+        if (mainWindow) {
+          const image = await mainWindow.webContents.capturePage()
+          captureDataUrl = image.toDataURL()
+          lastCaptureDataUrl = captureDataUrl
+        }
+        res.end(JSON.stringify({
+          project: {
+            path: currentProjectPath,
+            name: currentProjectPath ? currentProjectPath.split('/').pop() : null,
+            devServerUrl: devServerPort ? `http://localhost:${devServerPort}` : null
+          },
+          screenshot: captureDataUrl,
+          annotations: lastAnnotations,
+          timestamp: Date.now()
+        }))
+      } catch (e: any) {
+        res.statusCode = 500
+        res.end(JSON.stringify({ success: false, error: e.message }))
+      }
+      return
+    }
+
+    res.statusCode = 404
+    res.end(JSON.stringify({ error: 'Not found' }))
+  })
+
+  mcpApiServer.listen(MCP_API_PORT, '127.0.0.1', () => {
+    console.log(`[UIBridge] MCP API Server listening on http://127.0.0.1:${MCP_API_PORT}`)
+  })
+
+  mcpApiServer.on('error', (e) => {
+    console.error('[UIBridge] MCP API Server error:', e)
+  })
+}
 
 interface StoreSchema {
   recentProjects: string[]
@@ -28,7 +135,7 @@ function createWindow(): void {
     height: 900,
     minWidth: 900,
     minHeight: 600,
-    show: false,
+    show: true,
     autoHideMenuBar: true,
     backgroundColor: '#0c0c0c',
     titleBarStyle: 'hiddenInset',
@@ -44,7 +151,22 @@ function createWindow(): void {
 
   mainWindow.on('ready-to-show', () => {
     mainWindow!.show()
+    if (is.dev) mainWindow!.webContents.openDevTools({ mode: 'detach' })
   })
+
+  // Auto-capture screenshot 5s after launch for debugging
+  setTimeout(() => {
+    if (mainWindow) {
+      mainWindow.show()
+      mainWindow.center()
+      mainWindow.focus()
+      mainWindow.webContents.capturePage().then((image) => {
+        const path = require('path').join(require('os').homedir(), 'Desktop', 'uibridge-capture.png')
+        require('fs').writeFileSync(path, image.toPNG())
+        console.log('[UIBridge] Screenshot saved to', path)
+      }).catch(console.error)
+    }
+  }, 5000)
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
@@ -303,6 +425,16 @@ function setupFileWatcher(projectPath: string): void {
   fileWatcher.on('unlink', triggerReload)
 }
 
+// IPC: renderer pushes annotations to main process (for MCP API)
+ipcMain.on('mcp-update-annotations', (_, annotations: string) => {
+  lastAnnotations = annotations
+})
+
+// IPC: renderer pushes webview capture result
+ipcMain.on('mcp-capture-result', (_, dataUrl: string) => {
+  lastCaptureDataUrl = dataUrl
+})
+
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.uibridge.app')
 
@@ -310,6 +442,7 @@ app.whenReady().then(() => {
     optimizer.watchWindowShortcuts(window)
   })
 
+  startMcpApiServer()
   createWindow()
 
   app.on('activate', function () {

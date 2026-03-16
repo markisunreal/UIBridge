@@ -27,6 +27,19 @@ const api = {
   
   removeAllListeners: (channel: string) => {
     ipcRenderer.removeAllListeners(channel)
+  },
+
+  // MCP bridge: push annotations to main process
+  mcpUpdateAnnotations: (annotations: string) => {
+    ipcRenderer.send('mcp-update-annotations', annotations)
+  },
+  // MCP bridge: push webview capture to main process
+  mcpCaptureResult: (dataUrl: string) => {
+    ipcRenderer.send('mcp-capture-result', dataUrl)
+  },
+  // MCP bridge: listen for capture requests from main
+  onMcpCaptureRequest: (callback: () => void) => {
+    ipcRenderer.on('mcp-capture-request', () => callback())
   }
 }
 
